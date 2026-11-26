@@ -136,6 +136,210 @@ function borrarArchivos(...rutas) {
   }
 }
 
+// ---------- Análisis de stickers (/analizar) ----------
+
+const CHUNKS_CONOCIDOS = new Set(['VP8 ', 'VP8L', 'VP8X', 'ANIM', 'ANMF', 'ALPH', 'ICCP', 'EXIF', 'XMP ']);
+
+const FIRMAS_AUDIO = [
+  ['OggS', 'contenedor Ogg (Opus/Vorbis)'],
+  ['OpusHead', 'cabecera Opus'],
+  ['ID3', 'MP3 con etiqueta ID3'],
+  ['ftyp', 'contenedor MP4/M4A/AAC'],
+  ['fLaC', 'FLAC'],
+  ['#!AMR', 'AMR'],
+  ['WAVE', 'WAVE'],
+  ['AUDI', 'texto AUDI']
+];
+
+function hexVolcado(buf, desde, largo) {
+  const f = buf.subarray(desde, Math.min(buf.length, desde + largo));
+  const h = [...f].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+  const a = [...f].map((b) => (b >= 32 && b < 127 ? String.fromCharCode(b) : '.')).join('');
+  return `${h}  |${a}|`;
+}
+
+function textoImprimible(buf, max) {
+  return buf
+    .subarray(0, max)
+    .toString('latin1')
+    .replace(/[^\x20-\x7e]/g, '.');
+}
+
+// Devuelve { detalle: [...lineas para logs], resumen: [...lineas cortas para el chat] }
+function analizarWebp(buf) {
+  const D = [];
+  const R = [];
+
+  D.push(`Tamano total: ${buf.length} bytes`);
+  R.push(`Tamano: ${buf.length} bytes`);
+
+  if (
+    buf.length < 12 ||
+    buf.toString('ascii', 0, 4) !== 'RIFF' ||
+    buf.toString('ascii', 8, 12) !== 'WEBP'
+  ) {
+    D.push('NO es un WebP RIFF estandar. Primeros 48 bytes: ' + hexVolcado(buf, 0, 48));
+    R.push('No es un WebP RIFF estandar.');
+    return { detalle: D, resumen: R };
+  }
+
+  const declarado = buf.readUInt32LE(4) + 8;
+  D.push(`Cabecera RIFF: declara ${declarado} bytes, el archivo real tiene ${buf.length}`);
+
+  let extra = 0;
+  if (buf.length > declarado) {
+    extra = buf.length - declarado;
+    D.push(`!! Hay ${extra} bytes DESPUES del final RIFF declarado. Primeros: ` + hexVolcado(buf, declarado, 48));
+    R.push(`Hay ${extra} bytes despues del final del RIFF.`);
+  } else if (buf.length < declarado) {
+    D.push('!! El archivo es mas corto de lo que declara la cabecera (truncado).');
+  }
+
+  const fin = Math.min(buf.length, declarado);
+  const secuencia = [];
+  const desconocidos = [];
+  let frames = 0;
+  let pos = 12;
+
+  while (pos + 8 <= fin) {
+    const id = buf.toString('ascii', pos, pos + 4);
+    const tam = buf.readUInt32LE(pos + 4);
+    const ini = pos + 8;
+    const conocido = CHUNKS_CONOCIDOS.has(id);
+
+    if (id === 'ANMF') {
+      frames++;
+      if (frames <= 2) D.push(`@${pos} ANMF tam=${tam} (fotograma ${frames})`);
+    } else {
+      D.push(`@${pos} '${id}' tam=${tam}${conocido ? '' : '   <-- DESCONOCIDO'}`);
+      if (!secuencia.includes(id)) secuencia.push(id);
+    }
+
+    if (ini + tam > buf.length) {
+      D.push('!! Este bloque se sale del archivo (truncado). Fin del analisis de bloques.');
+      break;
+    }
+
+    if (id === 'VP8X' && tam >= 10) {
+      const fl = buf[ini];
+      const ancho = 1 + (buf[ini + 4] | (buf[ini + 5] << 8) | (buf[ini + 6] << 16));
+      const alto = 1 + (buf[ini + 7] | (buf[ini + 8] << 8) | (buf[ini + 9] << 16));
+      D.push(
+        `   VP8X flags=0x${fl.toString(16)} (ICC=${!!(fl & 0x20)} alfa=${!!(fl & 0x10)} EXIF=${!!(fl & 0x08)} XMP=${!!(fl & 0x04)} anim=${!!(fl & 0x02)}) lienzo=${ancho}x${alto}`
+      );
+    } else if (id === 'ANIM' && tam >= 6) {
+      D.push(`   ANIM fondo=${hexVolcado(buf, ini, 4).split('  ')[0]} repeticiones=${buf.readUInt16LE(ini + 4)}`);
+    } else if (id === 'EXIF') {
+      D.push('   EXIF hex: ' + hexVolcado(buf, ini, 64));
+      D.push('   EXIF texto: ' + textoImprimible(buf.subarray(ini, ini + tam), 400));
+    } else if (id === 'XMP ') {
+      D.push('   XMP texto: ' + textoImprimible(buf.subarray(ini, ini + tam), 400));
+    } else if (!conocido) {
+      desconocidos.push(`${id}(${tam})`);
+      D.push('   datos hex: ' + hexVolcado(buf, ini, 64));
+      D.push('   datos texto: ' + textoImprimible(buf.subarray(ini, ini + tam), 200));
+    }
+
+    pos = ini + tam + (tam % 2);
+  }
+
+  if (pos < fin) D.push(`!! Quedaron ${fin - pos} bytes sin interpretar dentro del RIFF en @${pos}: ` + hexVolcado(buf, pos, 32));
+
+  D.push(`Fotogramas ANMF: ${frames}`);
+  D.push('Ultimos 48 bytes del archivo: ' + hexVolcado(buf, Math.max(0, buf.length - 48), 48));
+
+  R.push(`Bloques: ${secuencia.join(', ')}${frames ? ` (+${frames} fotogramas)` : ''}`);
+  if (desconocidos.length) R.push(`Bloques DESCONOCIDOS: ${desconocidos.join(', ')}`);
+
+  // Búsqueda de firmas de audio en todo el archivo
+  const hallazgos = [];
+  for (const [firma, nombre] of FIRMAS_AUDIO) {
+    let desde = 0;
+    let veces = 0;
+    while (veces < 5) {
+      const i = buf.indexOf(firma, desde, 'latin1');
+      if (i === -1) break;
+      const dentro = i < declarado ? 'dentro del RIFF' : 'FUERA del RIFF';
+      D.push(`Firma '${firma}' (${nombre}) en @${i} (${dentro}): ` + hexVolcado(buf, i, 24));
+      hallazgos.push(`${firma}@${i}`);
+      desde = i + 1;
+      veces++;
+    }
+  }
+  R.push(hallazgos.length ? `Firmas de audio: ${hallazgos.join(', ')}` : 'Firmas de audio: ninguna encontrada');
+
+  return { detalle: D, resumen: R };
+}
+
+// Convierte Buffers y Long en algo legible para imprimir el mensaje del sticker.
+function mensajeLegible(obj) {
+  return JSON.stringify(
+    obj,
+    function (clave, valor) {
+      const original = this[clave];
+      if (original instanceof Uint8Array) return `<${original.length} bytes>`;
+      if (original && typeof original.toNumber === 'function') return original.toNumber();
+      return valor;
+    },
+    2
+  );
+}
+
+async function manejarAnalizar(sock, msg) {
+  const jid = msg.key.remoteJid;
+  const ctx = msg.message.extendedTextMessage?.contextInfo;
+  const quoted = ctx?.quotedMessage;
+  const sticker = quoted?.stickerMessage;
+
+  if (!sticker) {
+    await sock.sendMessage(
+      jid,
+      { text: 'Responde /analizar a un sticker para analizarlo.' },
+      { quoted: msg }
+    );
+    return;
+  }
+
+  try {
+    const mensajeMedia = {
+      key: { remoteJid: jid, id: ctx.stanzaId, participant: ctx.participant },
+      message: quoted
+    };
+
+    const buffer = await downloadMediaMessage(
+      mensajeMedia,
+      'buffer',
+      {},
+      { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage }
+    );
+
+    const { detalle, resumen } = analizarWebp(buffer);
+
+    console.log('[ANALIZAR] ===== INICIO =====');
+    console.log('[ANALIZAR] Tipos en el mensaje citado:', Object.keys(quoted).join(', '));
+    console.log('[ANALIZAR] stickerMessage:\n' + mensajeLegible(sticker));
+    for (const linea of detalle) console.log('[ANALIZAR] ' + linea);
+    console.log('[ANALIZAR] ===== FIN =====');
+
+    await sock.sendMessage(jid, { text: 'Analisis del sticker:\n' + resumen.join('\n') }, { quoted: msg });
+
+    await sock.sendMessage(
+      jid,
+      {
+        document: buffer,
+        mimetype: 'application/octet-stream',
+        fileName: `sticker_analizado_${Date.now()}.webp`
+      },
+      { quoted: msg }
+    );
+  } catch (e) {
+    console.error('[ANALIZAR] Error:', e);
+    try {
+      await sock.sendMessage(jid, { text: 'No pude analizar ese sticker.' }, { quoted: msg });
+    } catch {}
+  }
+}
+
 // ---------- Bot ----------
 
 async function iniciarBot() {
@@ -194,6 +398,11 @@ async function iniciarBot() {
       msg.message.videoMessage?.caption ||
       ''
     ).trim().toLowerCase();
+
+    if (texto.startsWith('/analizar')) {
+      await manejarAnalizar(sock, msg);
+      return;
+    }
 
     if (!texto.startsWith('/sa')) return;
 
