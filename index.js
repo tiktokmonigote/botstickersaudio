@@ -13,8 +13,14 @@ import path from 'path';
 
 const execFileAsync = promisify(execFile);
 
-const MAX_STICKER_BYTES = 500 * 1024;
-const CALIDADES = [50, 35, 20];
+// ---------- Configuración ----------
+const DURACION_MAX = 5;                  // segundos (entre 4 y 6)
+const MAX_STICKER_BYTES = 500 * 1024;    // límite de WhatsApp para stickers animados
+const INYECTAR_AUDIO_EN_WEBP = false;    // WhatsApp no reconoce el chunk AUDI (probado)
+const ENVIAR_NOTA_DE_VOZ = true;         // envía el audio como nota de voz tras el sticker
+
+const AJUSTES_NORMALES = { fps: 12, escala: 512, calidad: 40, nivel: 2 };
+const AJUSTES_LIVIANOS = { fps: 8, escala: 384, calidad: 25, nivel: 2 };
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,16 +35,22 @@ app.listen(PORT, () => {
 
 // ---------- Utilidades de conversión ----------
 
-async function convertirVideoASticker(entrada, salidaWebp, calidad) {
+async function convertirVideoASticker(entrada, salidaWebp, ajustes) {
+  const { fps, escala, calidad, nivel } = ajustes;
+  const filtro =
+    `fps=${fps},scale=${escala}:${escala}:force_original_aspect_ratio=decrease:flags=fast_bilinear,` +
+    `format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000`;
+
   await execFileAsync('ffmpeg', [
+    '-nostdin',
+    '-loglevel', 'error',
     '-y',
+    '-t', String(DURACION_MAX),
     '-i', entrada,
-    '-t', '6',
-    '-vf',
-    'fps=15,scale=512:512:force_original_aspect_ratio=decrease,format=rgba,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=0x00000000',
+    '-vf', filtro,
     '-vcodec', 'libwebp',
     '-lossless', '0',
-    '-compression_level', '6',
+    '-compression_level', String(nivel),
     '-q:v', String(calidad),
     '-loop', '0',
     '-preset', 'default',
@@ -48,13 +60,28 @@ async function convertirVideoASticker(entrada, salidaWebp, calidad) {
   ]);
 }
 
-// Devuelve true si se pudo extraer audio; false si el video no tiene pista de audio.
-async function extraerAudio(entrada, salidaOgg) {
+// Una pasada normal; solo si pesa de más, un único reintento más liviano.
+async function crearSticker(entrada, salidaWebp) {
+  await convertirVideoASticker(entrada, salidaWebp, AJUSTES_NORMALES);
+  let webp = fs.readFileSync(salidaWebp);
+
+  if (webp.length > MAX_STICKER_BYTES) {
+    console.log(`Sticker de ${webp.length} bytes, reintentando con ajustes livianos...`);
+    await convertirVideoASticker(entrada, salidaWebp, AJUSTES_LIVIANOS);
+    webp = fs.readFileSync(salidaWebp);
+  }
+  return webp;
+}
+
+// Devuelve el Buffer de audio (Opus/OGG mono) o null si no hay audio.
+async function obtenerAudio(entrada, salidaOgg) {
   try {
     await execFileAsync('ffmpeg', [
+      '-nostdin',
+      '-loglevel', 'error',
       '-y',
+      '-t', String(DURACION_MAX),
       '-i', entrada,
-      '-t', '6',
       '-vn',
       '-ac', '1',
       '-c:a', 'libopus',
@@ -62,13 +89,19 @@ async function extraerAudio(entrada, salidaOgg) {
       '-f', 'ogg',
       salidaOgg
     ]);
-    return fs.existsSync(salidaOgg) && fs.statSync(salidaOgg).size > 0;
-  } catch {
-    return false;
+    if (fs.existsSync(salidaOgg) && fs.statSync(salidaOgg).size > 0) {
+      return fs.readFileSync(salidaOgg);
+    }
+    console.log('Audio: ffmpeg termino pero no genero datos.');
+    return null;
+  } catch (e) {
+    const detalle = String(e.stderr || e.message || e).trim().split('\n').slice(-2).join(' | ');
+    console.log('Audio no disponible (puede que el video no tenga audio):', detalle);
+    return null;
   }
 }
 
-// Agrega un chunk RIFF 'AUDI' al final del WebP y corrige el tamaño de la cabecera RIFF.
+// Agrega un chunk RIFF 'AUDI' al final del WebP (desactivado por defecto: WhatsApp no lo reconoce).
 function inyectarAudioEnWebp(webp, audio) {
   if (
     webp.length < 12 ||
@@ -79,8 +112,6 @@ function inyectarAudioEnWebp(webp, audio) {
   }
 
   const partes = [webp];
-
-  // Los chunks RIFF deben empezar en posicion par.
   if (webp.length % 2 === 1) partes.push(Buffer.alloc(1));
 
   const cabeceraChunk = Buffer.alloc(8);
@@ -88,8 +119,6 @@ function inyectarAudioEnWebp(webp, audio) {
   cabeceraChunk.writeUInt32LE(audio.length, 4);
 
   partes.push(cabeceraChunk, audio);
-
-  // Padding si el tamaño del audio es impar (no se cuenta en el tamaño del chunk).
   if (audio.length % 2 === 1) partes.push(Buffer.alloc(1));
 
   const resultado = Buffer.concat(partes);
@@ -187,6 +216,8 @@ async function iniciarBot() {
     const salidaAudio = path.join('/tmp', `audio_${idTemp}.ogg`);
 
     try {
+      const inicio = Date.now();
+
       const mensajeMedia = videoDirecto
         ? msg
         : {
@@ -206,22 +237,29 @@ async function iniciarBot() {
       );
 
       fs.writeFileSync(entrada, buffer);
+      console.log(`Video descargado en ${Date.now() - inicio} ms`);
 
-      // 1) Audio (opcional: si el video no tiene audio, se envia sin audio)
-      const tieneAudio = await extraerAudio(entrada, salidaAudio);
-      const audioBuffer = tieneAudio ? fs.readFileSync(salidaAudio) : null;
+      // Sticker y audio se procesan a la vez
+      const [webp, audioBuffer] = await Promise.all([
+        crearSticker(entrada, salidaWebp),
+        obtenerAudio(entrada, salidaAudio)
+      ]);
+      console.log(`Conversion lista en ${Date.now() - inicio} ms (sticker ${webp.length} bytes)`);
 
-      // 2) Sticker WebP, bajando calidad si pasa del limite de tamaño
-      let stickerFinal = null;
-      for (const calidad of CALIDADES) {
-        await convertirVideoASticker(entrada, salidaWebp, calidad);
-        const webp = fs.readFileSync(salidaWebp);
-        stickerFinal = audioBuffer ? inyectarAudioEnWebp(webp, audioBuffer) : webp;
-        if (stickerFinal.length <= MAX_STICKER_BYTES) break;
-        console.log(`Sticker de ${stickerFinal.length} bytes con calidad ${calidad}, reintentando...`);
-      }
+      const stickerFinal =
+        INYECTAR_AUDIO_EN_WEBP && audioBuffer ? inyectarAudioEnWebp(webp, audioBuffer) : webp;
 
       await sock.sendMessage(msg.key.remoteJid, { sticker: stickerFinal }, { quoted: msg });
+
+      if (ENVIAR_NOTA_DE_VOZ && audioBuffer) {
+        await sock.sendMessage(
+          msg.key.remoteJid,
+          { audio: audioBuffer, mimetype: 'audio/ogg; codecs=opus', ptt: true },
+          { quoted: msg }
+        );
+      }
+
+      console.log(`Respuesta enviada en ${Date.now() - inicio} ms`);
     } catch (e) {
       console.error('Error procesando mensaje:', e);
       try {
