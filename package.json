@@ -1,0 +1,19 @@
+{
+  "name": "bot-stickers-audio",
+  "version": "2.0.0",
+  "type": "module",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "node scripts/patch-baileys.cjs",
+    "test": "node scripts/test-local.mjs"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "express": "^4.19.2",
+    "pino": "^9.0.0"
+  }
+}
