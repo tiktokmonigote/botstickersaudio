@@ -244,7 +244,15 @@ async function manejarAnalizar(sock, msg, contenido) {
 let intentos = 0;
 
 async function iniciarBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(SESION_DIR);
+  // Si defines MONGODB_URI en Render, la sesión se guarda en MongoDB y no se pierde al reiniciar.
+  let auth;
+  if (process.env.MONGODB_URI) {
+    const { usarAuthMongo } = await import('./src/auth-mongo.js');
+    auth = await usarAuthMongo(process.env.MONGODB_URI);
+  } else {
+    auth = await useMultiFileAuthState(SESION_DIR);
+  }
+  const { state, saveCreds } = auth;
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
